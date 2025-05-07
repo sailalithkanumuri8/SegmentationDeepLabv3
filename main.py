@@ -6,11 +6,10 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.preprocessing.image import load_img
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import cv2
 from tqdm import tqdm
 
-# Set random seed for reproducibility
 tf.random.set_seed(42)
 np.random.seed(42)
 
@@ -23,7 +22,6 @@ def DilatedSpatialPyramidPooling(inputs):
     """Atrous Spatial Pyramid Pooling with different dilation rates"""
     dims = inputs.shape
 
-    # Apply global average pooling
     x = layers.AveragePooling2D(pool_size=(dims[-3], dims[-2]))(inputs)
     x = layers.Conv2D(256, 1, padding="same")(x)
     x = layers.BatchNormalization()(x)
@@ -77,10 +75,13 @@ def DeepLabV3Plus(image_size, num_classes):
     for layer in resnet50.layers[:100]:
         layer.trainable = False
 
+    # Add L2 regularization to all trainable layers
+    regularizer = tf.keras.regularizers.l2(0.0001)
+
     # Get features from ResNet50
     x = resnet50.get_layer("conv4_block6_2_relu").output
 
-    # Apply ASPP
+    # Apply ASPP with regularization
     x = DilatedSpatialPyramidPooling(x)
 
     # Upsampling path
@@ -91,21 +92,23 @@ def DeepLabV3Plus(image_size, num_classes):
 
     # Get low-level features from ResNet50
     input_b = resnet50.get_layer("conv2_block3_2_relu").output
-    input_b = layers.Conv2D(48, 1, padding="same")(input_b)
+    input_b = layers.Conv2D(48, 1, padding="same", kernel_regularizer=regularizer)(input_b)
     input_b = layers.BatchNormalization()(input_b)
     input_b = layers.Activation("relu")(input_b)
 
     # Concatenate upsampled ASPP features with low-level features
     x = layers.Concatenate()([input_a, input_b])
 
-    # Final convolutions
-    x = layers.Conv2D(256, 3, padding="same")(x)
+    # Final convolutions with regularization
+    x = layers.Conv2D(256, 3, padding="same", kernel_regularizer=regularizer)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
+    x = layers.Dropout(0.3)(x)  # Add dropout
 
-    x = layers.Conv2D(256, 3, padding="same")(x)
+    x = layers.Conv2D(256, 3, padding="same", kernel_regularizer=regularizer)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
+    x = layers.Dropout(0.3)(x)  # Add dropout
 
     # Final upsampling to original image size
     x = layers.UpSampling2D(
@@ -116,11 +119,11 @@ def DeepLabV3Plus(image_size, num_classes):
     # Output layer
     if num_classes == 1:
         # Binary segmentation
-        x = layers.Conv2D(num_classes, 1, padding="same")(x)
+        x = layers.Conv2D(num_classes, 1, padding="same", kernel_regularizer=regularizer)(x)
         x = layers.Activation("sigmoid")(x)
     else:
         # Multi-class segmentation
-        x = layers.Conv2D(num_classes, 1, padding="same")(x)
+        x = layers.Conv2D(num_classes, 1, padding="same", kernel_regularizer=regularizer)(x)
         x = layers.Activation("softmax")(x)
 
     return keras.Model(inputs=model_input, outputs=x)
@@ -212,8 +215,8 @@ def create_data_generators(images, masks, batch_size, num_classes, validation_sp
     )
 
     # Create image data generator
-    image_datagen = keras.preprocessing.image.ImageDataGenerator(**data_gen_args)
-    mask_datagen = keras.preprocessing.image.ImageDataGenerator(**data_gen_args)
+    image_datagen = ImageDataGenerator(**data_gen_args)
+    mask_datagen = ImageDataGenerator(**data_gen_args)
 
     # Create generators
     seed = 42
@@ -224,7 +227,7 @@ def create_data_generators(images, masks, batch_size, num_classes, validation_sp
     train_generator = zip(image_generator, mask_generator)
 
     # No augmentation for validation data
-    val_datagen = keras.preprocessing.image.ImageDataGenerator()
+    val_datagen = ImageDataGenerator()
     val_image_generator = val_datagen.flow(X_val, batch_size=batch_size, seed=seed)
     val_mask_generator = val_datagen.flow(y_val, batch_size=batch_size, seed=seed)
     val_generator = zip(val_image_generator, val_mask_generator)
@@ -255,11 +258,22 @@ def create_tf_dataset(images, masks, batch_size, num_classes, is_training=True):
                 image = tf.image.flip_left_right(image)
                 mask = tf.image.flip_left_right(mask)
 
+            # Random flip up-down
+            if tf.random.uniform(()) > 0.5:
+                image = tf.image.flip_up_down(image)
+                mask = tf.image.flip_up_down(mask)
+
             # Random brightness
-            image = tf.image.random_brightness(image, max_delta=0.1)
+            image = tf.image.random_brightness(image, max_delta=0.2)
 
             # Random contrast
-            image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
+            image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
+
+            # Random saturation
+            image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
+
+            # Random hue
+            image = tf.image.random_hue(image, max_delta=0.1)
 
             # Ensure image values are in [0, 1]
             image = tf.clip_by_value(image, 0, 1)
@@ -281,6 +295,21 @@ def create_tf_dataset(images, masks, batch_size, num_classes, is_training=True):
 def train_model(model, train_dataset, val_dataset, epochs, steps_per_epoch, validation_steps):
     """Train the DeepLabV3+ model"""
 
+    # Define learning rate schedule with warmup
+    initial_learning_rate = 0.001
+    warmup_epochs = 5
+    decay_epochs = epochs - warmup_epochs
+
+    def warmup_cosine_decay_schedule(epoch):
+        # Warmup phase
+        if epoch < warmup_epochs:
+            return initial_learning_rate * ((epoch + 1) / warmup_epochs)
+        # Cosine decay phase
+        else:
+            progress = (epoch - warmup_epochs) / decay_epochs
+            cosine_decay = 0.5 * (1 + tf.cos(3.14159 * progress))
+            return initial_learning_rate * cosine_decay
+
     # Define callbacks
     callbacks = [
         keras.callbacks.ModelCheckpoint(
@@ -288,16 +317,12 @@ def train_model(model, train_dataset, val_dataset, epochs, steps_per_epoch, vali
             save_best_only=True,
             monitor="val_loss"
         ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.2,
-            patience=3,
-            min_lr=1e-6
-        ),
+        keras.callbacks.LearningRateScheduler(warmup_cosine_decay_schedule),
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=10,
-            restore_best_weights=True
+            patience=15,
+            restore_best_weights=True,
+            verbose=1
         ),
         keras.callbacks.TensorBoard(
             log_dir="logs/deeplabv3plus"
@@ -363,14 +388,22 @@ def evaluate_model(model, test_images, test_masks, num_classes):
 
 def main():
     # Configuration
-    IMAGE_SIZE = 512
-    BATCH_SIZE = 8
-    EPOCHS = 50
-    NUM_CLASSES = 21  # 20 classes + background (for Pascal VOC)
-    # For binary segmentation, set NUM_CLASSES = 1
+    IMAGE_SIZE = 256
+    BATCH_SIZE = 4
+    EPOCHS = 100
+    NUM_CLASSES = 21
+    INITIAL_LEARNING_RATE = 0.001  # Reduced from 0.01
+
+    # Enable memory growth for GPU
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
 
     # Paths to your dataset
-    # Replace these with your actual dataset paths
     IMAGE_DIR = "path/to/images"
     MASK_DIR = "path/to/masks"
 
@@ -387,8 +420,17 @@ def main():
             # Binary masks
             masks = np.random.randint(0, 2, size=(num_samples, IMAGE_SIZE, IMAGE_SIZE))
         else:
-            # Multi-class masks
-            masks = np.random.randint(0, NUM_CLASSES, size=(num_samples, IMAGE_SIZE, IMAGE_SIZE))
+            # Multi-class masks with more structured patterns
+            masks = np.zeros((num_samples, IMAGE_SIZE, IMAGE_SIZE), dtype=np.int32)
+            for i in range(num_samples):
+                # Create some structured patterns
+                center_x = np.random.randint(0, IMAGE_SIZE)
+                center_y = np.random.randint(0, IMAGE_SIZE)
+                radius = np.random.randint(20, 50)
+                y, x = np.ogrid[:IMAGE_SIZE, :IMAGE_SIZE]
+                dist_from_center = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
+                mask = dist_from_center <= radius
+                masks[i] = mask.astype(np.int32) * np.random.randint(1, NUM_CLASSES)
 
         print(f"Created {num_samples} synthetic samples for demonstration")
     else:
@@ -417,7 +459,7 @@ def main():
     print("Creating DeepLabV3+ model...")
     model = DeepLabV3Plus(IMAGE_SIZE, NUM_CLASSES)
 
-    # Compile model
+    # Compile model with mixed precision
     if NUM_CLASSES == 1:
         # Binary segmentation
         loss = keras.losses.BinaryCrossentropy()
@@ -427,14 +469,23 @@ def main():
         ]
     else:
         # Multi-class segmentation
-        loss = keras.losses.SparseCategoricalCrossentropy()
+        loss = keras.losses.CategoricalCrossentropy()
         metrics = [
-            tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+            tf.keras.metrics.CategoricalAccuracy(name="accuracy"),
             tf.keras.metrics.MeanIoU(num_classes=NUM_CLASSES, name="mean_iou")
         ]
 
+    # Enable mixed precision training
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+    # Create optimizer with learning rate schedule and gradient clipping
+    optimizer = keras.optimizers.Adam(
+        learning_rate=INITIAL_LEARNING_RATE,
+        clipnorm=1.0  # Add gradient clipping
+    )
+
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=optimizer,
         loss=loss,
         metrics=metrics
     )
@@ -459,7 +510,7 @@ def main():
 
     # Evaluate on a few test samples
     print("Evaluating model...")
-    test_samples = 5
+    test_samples = 3
     test_indices = np.random.choice(len(val_images), test_samples, replace=False)
     test_images = val_images[test_indices]
     test_masks = val_masks[test_indices]
@@ -582,7 +633,6 @@ if __name__ == "__main__":
     # Train the model
     main()
 
-    # Example of inference (uncomment to use)
     """
     # For inference on a new image
     IMAGE_SIZE = 512
